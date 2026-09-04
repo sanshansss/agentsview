@@ -219,8 +219,9 @@ func countDuplicatePromptsPairwise(prompts []promptInfo) int {
 	seen := make([]promptInfo, 0, len(prompts))
 	repeats := 0
 	for _, p := range prompts {
-		if isControlPrompt(p.Normalized) ||
-			len(p.Normalized) < 20 || len(p.Tokens) < 4 {
+		if isControlPrompt(p.Normalized) || promptLength(p.Normalized) < 20 ||
+			(len(p.Tokens) < 4 &&
+				!(containsHan(p.Normalized) && len(p.Tokens) >= 2)) {
 			continue
 		}
 		duplicate := false

@@ -36,6 +36,11 @@ the source sessions and jump to the relevant transcript evidence. Sessions that
 cannot be scored remain visible in the coverage counts instead of being silently
 treated as healthy.
 
+Prompt and workflow heuristics recognize English plus Simplified and
+Traditional Chinese phrases. Chinese text is matched literally, so this
+improves coverage for common coding prompts without turning the score into a
+semantic or model-based assessment.
+
 Use Generated insights when you want a model-written report over a chosen scope.
 Use Quality when you need repeatable metrics whose results do not depend on a
 model response.
