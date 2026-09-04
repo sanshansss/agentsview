@@ -198,7 +198,7 @@ func scanSessionRowWithSource(rs rowScanner, includeSource bool) (Session, error
 	return s, err
 }
 
-const CurrentQualitySignalVersion = 3
+const CurrentQualitySignalVersion = 4
 
 // QualitySignals groups persisted deterministic quality-signal
 // columns for API callers while keeping the database representation

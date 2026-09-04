@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 // HeuristicMessage is the message subset needed by deterministic
@@ -44,7 +45,7 @@ var (
 	)
 	bulletRe            = regexp.MustCompile(`(?m)^\s*(?:[-*+]|\d+\.)\s+\S+`)
 	frustrationPhraseRe = regexp.MustCompile(
-		`(?i)(!{3,}|\?{3,}|\b(?:wtf|come on|why won't|this is broken|doesn't work|does not work|still broken|same error|you broke|fucking|fuck)\b)`,
+		`(?i)([!！]{3,}|[?？]{3,}|\b(?:wtf|come on|why won't|this is broken|doesn't work|does not work|still broken|same error|you broke|fucking|fuck)\b)`,
 	)
 )
 
@@ -53,6 +54,11 @@ var controlPrompts = map[string]struct{}{
 	"continue": {}, "go ahead": {}, "proceed": {},
 	"do it": {}, "done": {}, "thanks": {}, "thank you": {},
 	"please continue": {}, "keep going": {},
+	// Simplified and Traditional Chinese control prompts.
+	"是的": {}, "好的": {}, "好": {}, "可以": {}, "继续": {},
+	"請繼續": {}, "请继续": {}, "繼續": {}, "继续吧": {}, "繼續吧": {},
+	"做吧": {}, "完成": {},
+	"谢谢": {}, "謝謝": {}, "感谢": {}, "感謝": {},
 }
 
 // AnalyzeHeuristics computes deterministic prompt/context/workflow
@@ -97,7 +103,8 @@ func IsFrustrationMarker(content string) bool {
 	if len(normalized) < 10 {
 		return false
 	}
-	if frustrationPhraseRe.MatchString(normalized) {
+	if frustrationPhraseRe.MatchString(normalized) ||
+		containsAnyPhrase(normalized, heuristicKeywords.FrustrationPhrases) {
 		return true
 	}
 	return capsWordRatio(content, 3) >= 0.4
@@ -196,8 +203,12 @@ func countShortStartPrompts(prompts []promptInfo) int {
 
 func isShortPrompt(p promptInfo) bool {
 	return !isControlPrompt(p.Normalized) &&
-		len(p.Normalized) > 0 &&
-		len(p.Normalized) < 30
+		promptLength(p.Normalized) > 0 &&
+		promptLength(p.Normalized) < 30
+}
+
+func promptLength(normalized string) int {
+	return utf8.RuneCountInString(normalized)
 }
 
 func hasStaleAssistantBefore(p promptInfo) bool {
@@ -272,12 +283,52 @@ func promptTokens(normalized string) []string {
 			r != '_' && r != '-'
 	})
 	tokens := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if len(p) >= 3 {
-			tokens = append(tokens, p)
+	for _, part := range parts {
+		if !containsHan(part) {
+			if len(part) >= 3 {
+				tokens = append(tokens, part)
+			}
+			continue
+		}
+
+		// Chinese text normally arrives as one uninterrupted token. Use
+		// overlapping Han bigrams for duplicate-prompt detection while
+		// retaining Latin words embedded in mixed-language prompts.
+		runes := []rune(part)
+		for i := 0; i < len(runes); {
+			if unicode.Is(unicode.Han, runes[i]) {
+				start := i
+				for i < len(runes) && unicode.Is(unicode.Han, runes[i]) {
+					i++
+				}
+				if i-start == 1 {
+					tokens = append(tokens, string(runes[start:i]))
+				}
+				for j := start; j+1 < i; j++ {
+					tokens = append(tokens, string(runes[j:j+2]))
+				}
+				continue
+			}
+
+			start := i
+			for i < len(runes) && !unicode.Is(unicode.Han, runes[i]) {
+				i++
+			}
+			if token := string(runes[start:i]); len(token) >= 3 {
+				tokens = append(tokens, token)
+			}
 		}
 	}
 	return tokens
+}
+
+func containsHan(s string) bool {
+	for _, r := range s {
+		if unicode.Is(unicode.Han, r) {
+			return true
+		}
+	}
+	return false
 }
 
 func capsWordRatio(content string, minWords int) float64 {
@@ -332,10 +383,10 @@ func firstSubstantivePrompt(prompts []promptInfo) (promptInfo, bool) {
 func isCodeTask(prompts []promptInfo) bool {
 	for _, p := range prompts {
 		text := p.Normalized
-		if hasFileRef(p.Content) && hasCodeAction(p.Tokens) {
+		if hasFileRef(p.Content) && hasCodeAction(text, p.Tokens) {
 			return true
 		}
-		if hasCodeAction(p.Tokens) && hasCodeObject(p.Tokens) {
+		if hasCodeAction(text, p.Tokens) && hasCodeObject(text, p.Tokens) {
 			return true
 		}
 		if strings.Contains(text, "failing test") ||
@@ -348,28 +399,31 @@ func isCodeTask(prompts []promptInfo) bool {
 	return false
 }
 
-func hasCodeAction(tokens []string) bool {
-	phrases := []string{
-		"implement", "fix", "debug", "refactor", "update",
-		"change", "add", "remove", "create", "write",
-		"test", "lint", "compile", "build", "wire",
-	}
-	return containsAnyToken(tokens, phrases)
+func hasCodeAction(normalized string, tokens []string) bool {
+	return containsAnyTokenOrCJKPhrase(
+		normalized, tokens, heuristicKeywords.CodeActions,
+	)
 }
 
-func hasCodeObject(tokens []string) bool {
-	phrases := []string{
-		"code", "codebase", "repo", "repository", "app",
-		"backend", "frontend", "api", "endpoint", "component",
-		"function", "class", "module", "package", "schema",
-		"migration", "test", "tests", "bug", "error",
-	}
-	return containsAnyToken(tokens, phrases)
+func hasCodeObject(normalized string, tokens []string) bool {
+	return containsAnyTokenOrCJKPhrase(
+		normalized, tokens, heuristicKeywords.CodeObjects,
+	)
 }
 
-func containsAnyToken(tokens []string, words []string) bool {
-	for _, word := range words {
-		if slices.Contains(tokens, word) {
+func containsAnyTokenOrCJKPhrase(
+	normalized string,
+	tokens []string,
+	keywords []string,
+) bool {
+	for _, keyword := range keywords {
+		if containsHan(keyword) {
+			if strings.Contains(normalized, keyword) {
+				return true
+			}
+			continue
+		}
+		if slices.Contains(tokens, keyword) {
 			return true
 		}
 	}
@@ -377,50 +431,31 @@ func containsAnyToken(tokens []string, words []string) bool {
 }
 
 func isUnstructuredStart(p promptInfo) bool {
-	if hasFileRef(p.Content) || hasConstraintLanguage(p.Tokens) ||
+	if hasFileRef(p.Content) ||
+		hasConstraintLanguage(p.Normalized, p.Tokens) ||
 		hasSpecStructure(p.Content, p.Normalized) {
 		return false
 	}
 	return true
 }
 
-func hasConstraintLanguage(tokens []string) bool {
-	phrases := []string{
-		"must", "never", "only", "preserve", "keep", "avoid",
-		"require", "requires", "constraint", "constraints",
-		"acceptance", "criteria", "success", "expected",
-		"output", "format", "verify", "validation", "test",
-		"tests",
-	}
-	return containsAnyToken(tokens, phrases)
+func hasConstraintLanguage(normalized string, tokens []string) bool {
+	return containsAnyTokenOrCJKPhrase(
+		normalized, tokens, heuristicKeywords.ConstraintTerms,
+	)
 }
 
 func hasSpecStructure(content, normalized string) bool {
 	if strings.Contains(content, "\n#") || bulletRe.MatchString(content) {
 		return true
 	}
-	phrases := []string{
-		"acceptance criteria", "success criteria", "requirements",
-		"steps", "plan", "scope", "non-scope",
-	}
-	for _, phrase := range phrases {
-		if strings.Contains(normalized, phrase) {
-			return true
-		}
-	}
-	return false
+	return containsAnyPhrase(normalized, heuristicKeywords.SpecStructurePhrases)
 }
 
 func hasSuccessCriteria(prompts []promptInfo) bool {
 	for _, p := range prompts {
-		text := p.Normalized
-		for _, phrase := range []string{
-			"success", "acceptance", "expected", "done when",
-			"should result", "output", "criteria",
-		} {
-			if strings.Contains(text, phrase) {
-				return true
-			}
+		if containsAnyPhrase(p.Normalized, heuristicKeywords.SuccessCriteriaTerms) {
+			return true
 		}
 	}
 	return false
@@ -428,15 +463,17 @@ func hasSuccessCriteria(prompts []promptInfo) bool {
 
 func hasVerificationLanguage(prompts []promptInfo) bool {
 	for _, p := range prompts {
-		text := p.Normalized
-		for _, phrase := range []string{
-			"test", "tests", "verify", "verification",
-			"validate", "validation", "check", "reproduce",
-			"proof", "run",
-		} {
-			if strings.Contains(text, phrase) {
-				return true
-			}
+		if containsAnyPhrase(p.Normalized, heuristicKeywords.VerificationTerms) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAnyPhrase(normalized string, phrases []string) bool {
+	for _, phrase := range phrases {
+		if strings.Contains(normalized, phrase) {
+			return true
 		}
 	}
 	return false
@@ -471,8 +508,7 @@ func countDuplicatePrompts(prompts []promptInfo) int {
 	touched := make([]int, 0, len(prompts))
 	repeats := 0
 	for _, p := range prompts {
-		if isControlPrompt(p.Normalized) ||
-			len(p.Normalized) < 20 || len(p.Tokens) < 4 {
+		if !isDuplicatePromptCandidate(p) {
 			continue
 		}
 		if _, ok := seenNormalized[p.Normalized]; ok {
@@ -525,6 +561,18 @@ func countDuplicatePrompts(prompts []promptInfo) int {
 		}
 	}
 	return repeats
+}
+
+func isDuplicatePromptCandidate(p promptInfo) bool {
+	if isControlPrompt(p.Normalized) || promptLength(p.Normalized) < 20 {
+		return false
+	}
+	if len(p.Tokens) >= 4 {
+		return true
+	}
+	// Han bigrams provide enough signal for a Chinese prompt even when
+	// it contains fewer whitespace-delimited tokens than an English one.
+	return containsHan(p.Normalized) && len(p.Tokens) >= 2
 }
 
 func jaccardFromOverlap(currentUnique, previousTotal, intersections int) float64 {
